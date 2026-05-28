@@ -86,8 +86,51 @@ def new_session(timeout: int = 10) -> requests.Session:
 
 
 def login(url: str, s: requests.Session, username: str, password: str) -> Tuple[bool, str]:
-    """登录 Nginx-UI, 返回 (成功, token)"""
+    """登录 Nginx-UI, 返回 (成功, token)
+    Nginx-UI 使用 RSA 加密传输凭据 (EncryptedParams 中间件)
+    步骤: 1) 获取 RSA 公钥  2) 加密凭据  3) 发送登录请求
+    """
     try:
+        # 方法1: 获取 RSA 公钥并加密传输 (新版 Nginx-UI)
+        try:
+            r_crypto = s.get(build_url(url, '/api/crypto'), timeout=5)
+            if r_crypto.status_code == 200:
+                crypto_data = r_crypto.json()
+                public_key_pem = crypto_data.get('public_key', '') or crypto_data.get('data', {}).get('public_key', '')
+                if public_key_pem:
+                    from cryptography.hazmat.primitives import serialization, hashes
+                    from cryptography.hazmat.primitives.asymmetric import padding
+                    import base64
+
+                    pubkey = serialization.load_pem_public_key(public_key_pem.encode())
+                    enc_name = base64.b64encode(
+                        pubkey.encrypt(username.encode(),
+                                       padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                                                    algorithm=hashes.SHA256(), label=None))
+                    ).decode()
+                    enc_pwd = base64.b64encode(
+                        pubkey.encrypt(password.encode(),
+                                       padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                                                    algorithm=hashes.SHA256(), label=None))
+                    ).decode()
+
+                    r = s.post(build_url(url, '/api/login'),
+                               json={'name': enc_name, 'password': enc_pwd},
+                               timeout=10)
+                    if r.status_code == 200:
+                        data = r.json()
+                        token = data.get('token', '')
+                        if token:
+                            s.headers['Authorization'] = f'Bearer {token}'
+                            return True, token
+                    elif r.status_code == 199:
+                        safe_print(f"  {C.YLW}[*] 登录需要 2FA 验证 (HTTP 199){C.RST}")
+        except ImportError:
+            pass  # cryptography 库未安装, 回退明文
+        except Exception:
+            pass  # 加密方式失败, 回退明文
+
+        # 方法2: 明文传输 (旧版 Nginx-UI 或未启用 EncryptedParams)
         r = s.post(build_url(url, '/api/login'),
                    json={'name': username, 'password': password}, timeout=10)
         if r.status_code == 200:
@@ -96,8 +139,12 @@ def login(url: str, s: requests.Session, username: str, password: str) -> Tuple[
             if token:
                 s.headers['Authorization'] = f'Bearer {token}'
                 return True, token
+        elif r.status_code == 199:
+            safe_print(f"  {C.YLW}[*] 登录需要 2FA 验证 (HTTP 199){C.RST}")
+
         return False, ''
-    except Exception:
+    except Exception as e:
+        safe_print(f"  {C.YLW}[*] 登录异常: {e}{C.RST}")
         return False, ''
 
 
