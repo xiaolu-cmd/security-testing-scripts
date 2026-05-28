@@ -87,50 +87,64 @@ def new_session(timeout: int = 10) -> requests.Session:
 
 def login(url: str, s: requests.Session, username: str, password: str) -> Tuple[bool, str]:
     """登录 Nginx-UI, 返回 (成功, token)
-    Nginx-UI 使用 RSA 加密传输凭据 (EncryptedParams 中间件)
-    步骤: 1) 获取 RSA 公钥  2) 加密凭据  3) 发送登录请求
+    Nginx-UI EncryptedParams 中间件流程:
+    1) POST /api/crypto/public_key 获取 RSA 公钥
+    2) PKCS1v15 加密整个 JSON 凭据
+    3) 包在 encrypted_params 字段中发送
     """
+    import json as _json
+    import base64
+    import time as _time
+
     try:
-        # 方法1: 获取 RSA 公钥并加密传输 (新版 Nginx-UI)
-        try:
-            r_crypto = s.get(build_url(url, '/api/crypto'), timeout=5)
-            if r_crypto.status_code == 200:
-                crypto_data = r_crypto.json()
-                public_key_pem = crypto_data.get('public_key', '') or crypto_data.get('data', {}).get('public_key', '')
-                if public_key_pem:
-                    from cryptography.hazmat.primitives import serialization, hashes
-                    from cryptography.hazmat.primitives.asymmetric import padding
-                    import base64
+        # Step 1: 获取 RSA 公钥
+        r_crypto = s.post(build_url(url, '/api/crypto/public_key'), json={
+            'timestamp': str(int(_time.time() * 1000)),
+            'browser_fingerprint': 'Mozilla/5.0',
+        }, timeout=5)
 
-                    pubkey = serialization.load_pem_public_key(public_key_pem.encode())
-                    enc_name = base64.b64encode(
-                        pubkey.encrypt(username.encode(),
-                                       padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                                                    algorithm=hashes.SHA256(), label=None))
-                    ).decode()
-                    enc_pwd = base64.b64encode(
-                        pubkey.encrypt(password.encode(),
-                                       padding.OAEP(mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                                                    algorithm=hashes.SHA256(), label=None))
-                    ).decode()
+        if r_crypto.status_code == 200:
+            crypto_data = r_crypto.json()
+            public_key_pem = (crypto_data.get('public_key', '') or
+                              crypto_data.get('data', {}).get('public_key', '') or
+                              crypto_data.get('key', ''))
 
-                    r = s.post(build_url(url, '/api/login'),
-                               json={'name': enc_name, 'password': enc_pwd},
-                               timeout=10)
-                    if r.status_code == 200:
-                        data = r.json()
-                        token = data.get('token', '')
-                        if token:
-                            s.headers['Authorization'] = f'Bearer {token}'
-                            return True, token
-                    elif r.status_code == 199:
-                        safe_print(f"  {C.YLW}[*] 登录需要 2FA 验证 (HTTP 199){C.RST}")
-        except ImportError:
-            pass  # cryptography 库未安装, 回退明文
-        except Exception:
-            pass  # 加密方式失败, 回退明文
+            if public_key_pem:
+                from cryptography.hazmat.primitives import serialization
+                from cryptography.hazmat.primitives.asymmetric import padding
 
-        # 方法2: 明文传输 (旧版 Nginx-UI 或未启用 EncryptedParams)
+                pubkey = serialization.load_pem_public_key(public_key_pem.encode())
+
+                # Step 2: 加密凭据 JSON (PKCS1v15, 与服务端 DecryptPKCS1v15 匹配)
+                creds_json = _json.dumps({'name': username, 'password': password})
+                # RSA 2048 最多加密 245 字节, 凭据 JSON 远小于此
+                encrypted = pubkey.encrypt(creds_json.encode(), padding.PKCS1v15())
+                enc_b64 = base64.b64encode(encrypted).decode()
+
+                # Step 3: 发送 encrypted_params 包裹的请求
+                r = s.post(build_url(url, '/api/login'),
+                           json={'encrypted_params': enc_b64}, timeout=10)
+
+                if r.status_code == 200:
+                    data = r.json()
+                    token = data.get('token', '')
+                    if token:
+                        s.headers['Authorization'] = f'Bearer {token}'
+                        return True, token
+                elif r.status_code == 199:
+                    safe_print(f"  {C.YLW}[*] 登录需要 2FA 验证 (HTTP 199){C.RST}")
+                elif r.status_code == 400:
+                    # 加密方式可能不对, 回退明文
+                    safe_print(f"  {C.YLW}[*] 加密失败 (HTTP 400), 尝试明文...{C.RST}")
+
+    except ImportError:
+        # cryptography 库未安装
+        safe_print(f"  {C.YLW}[*] cryptography 未安装, 使用明文登录{C.RST}")
+    except Exception as e:
+        safe_print(f"  {C.YLW}[*] 加密登录异常: {e}, 回退明文{C.RST}")
+
+    # 回退: 明文传输 (旧版 Nginx-UI)
+    try:
         r = s.post(build_url(url, '/api/login'),
                    json={'name': username, 'password': password}, timeout=10)
         if r.status_code == 200:
@@ -141,11 +155,10 @@ def login(url: str, s: requests.Session, username: str, password: str) -> Tuple[
                 return True, token
         elif r.status_code == 199:
             safe_print(f"  {C.YLW}[*] 登录需要 2FA 验证 (HTTP 199){C.RST}")
-
-        return False, ''
     except Exception as e:
-        safe_print(f"  {C.YLW}[*] 登录异常: {e}{C.RST}")
-        return False, ''
+        safe_print(f"  {C.YLW}[*] 明文登录异常: {e}{C.RST}")
+
+    return False, ''
 
 
 # ===================== 0. 指纹检测 =====================
