@@ -85,23 +85,71 @@ def new_session(timeout: int = 10) -> requests.Session:
     return s
 
 
-def login(url: str, s: requests.Session, username: str, password: str) -> Tuple[bool, str]:
+def _try_login_request(url: str, s: requests.Session, json_body: dict,
+                       debug: bool = False) -> Tuple[int, dict]:
+    """发送一次登录请求, 返回 (status_code, response_json_or_text)"""
+    r = s.post(build_url(url, '/api/login'), json=json_body, timeout=10)
+    try:
+        data = r.json()
+    except Exception:
+        data = {'_raw': r.text}
+    if debug:
+        safe_print(f"    [{r.status_code}] → {str(data)[:300]}")
+    return r.status_code, data
+
+
+def login(url: str, s: requests.Session, username: str, password: str,
+          debug: bool = True) -> Tuple[bool, str]:
     """登录 Nginx-UI, 返回 (成功, token)
-    Nginx-UI EncryptedParams 中间件流程:
-    1) POST /api/crypto/public_key 获取 RSA 公钥
-    2) PKCS1v15 加密整个 JSON 凭据
-    3) 包在 encrypted_params 字段中发送
+
+    Nginx-UI 多版本登录兼容:
+    1. 明文 POST {name, password} → /api/login (最常见)
+    2. RSA 加密 POST {encrypted_params} → /api/login (新版)
+    3. 其他端点: /api/auth/login
     """
     import json as _json
     import base64
     import time as _time
 
+    safe_print(f"  {C.CYN}[*] 尝试登录: {username}:{password}@{url}{C.RST}")
+
+    # ===== 方法 1: 明文登录 (大多数版本) =====
+    safe_print(f"  {C.CYN}    [1/4] 明文 POST /api/login...{C.RST}")
+    status, data = _try_login_request(url, s, {'name': username, 'password': password}, debug)
+    if status == 200:
+        token = data.get('token', '')
+        if token:
+            s.headers['Authorization'] = f'Bearer {token}'
+            safe_print(f"  {C.GRN}[+] 明文登录成功!{C.RST}")
+            return True, token
+
+    # ===== 方法 2: 明文到 /api/auth/login =====
+    safe_print(f"  {C.CYN}    [2/4] 明文 POST /api/auth/login...{C.RST}")
     try:
-        # Step 1: 获取 RSA 公钥
+        r = s.post(build_url(url, '/api/auth/login'),
+                   json={'name': username, 'password': password}, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            token = data.get('token', '')
+            if token:
+                s.headers['Authorization'] = f'Bearer {token}'
+                safe_print(f"  {C.GRN}[+] 明文登录成功 (auth endpoint)!{C.RST}")
+                return True, token
+        if debug:
+            safe_print(f"    [{r.status_code}] → {r.text[:200]}")
+    except Exception:
+        pass
+
+    # ===== 方法 3: RSA 加密登录 =====
+    safe_print(f"  {C.CYN}    [3/4] RSA 加密 POST /api/login...{C.RST}")
+    try:
+        # 获取公钥
         r_crypto = s.post(build_url(url, '/api/crypto/public_key'), json={
             'timestamp': str(int(_time.time() * 1000)),
             'browser_fingerprint': 'Mozilla/5.0',
         }, timeout=5)
+        if debug:
+            safe_print(f"    /api/crypto/public_key → [{r_crypto.status_code}] {r_crypto.text[:200]}")
 
         if r_crypto.status_code == 200:
             crypto_data = r_crypto.json()
@@ -114,50 +162,43 @@ def login(url: str, s: requests.Session, username: str, password: str) -> Tuple[
                 from cryptography.hazmat.primitives.asymmetric import padding
 
                 pubkey = serialization.load_pem_public_key(public_key_pem.encode())
-
-                # Step 2: 加密凭据 JSON (PKCS1v15, 与服务端 DecryptPKCS1v15 匹配)
                 creds_json = _json.dumps({'name': username, 'password': password})
-                # RSA 2048 最多加密 245 字节, 凭据 JSON 远小于此
                 encrypted = pubkey.encrypt(creds_json.encode(), padding.PKCS1v15())
                 enc_b64 = base64.b64encode(encrypted).decode()
 
-                # Step 3: 发送 encrypted_params 包裹的请求
-                r = s.post(build_url(url, '/api/login'),
-                           json={'encrypted_params': enc_b64}, timeout=10)
-
-                if r.status_code == 200:
-                    data = r.json()
+                status, data = _try_login_request(url, s, {'encrypted_params': enc_b64}, debug)
+                if status == 200:
                     token = data.get('token', '')
                     if token:
                         s.headers['Authorization'] = f'Bearer {token}'
+                        safe_print(f"  {C.GRN}[+] RSA 加密登录成功!{C.RST}")
                         return True, token
-                elif r.status_code == 199:
-                    safe_print(f"  {C.YLW}[*] 登录需要 2FA 验证 (HTTP 199){C.RST}")
-                elif r.status_code == 400:
-                    # 加密方式可能不对, 回退明文
-                    safe_print(f"  {C.YLW}[*] 加密失败 (HTTP 400), 尝试明文...{C.RST}")
-
     except ImportError:
-        # cryptography 库未安装
-        safe_print(f"  {C.YLW}[*] cryptography 未安装, 使用明文登录{C.RST}")
+        safe_print(f"    {C.CYN}cryptography 未安装, 跳过{C.RST}")
     except Exception as e:
-        safe_print(f"  {C.YLW}[*] 加密登录异常: {e}, 回退明文{C.RST}")
+        safe_print(f"    {C.CYN}RSA 加密异常: {e}{C.RST}")
 
-    # 回退: 明文传输 (旧版 Nginx-UI)
-    try:
-        r = s.post(build_url(url, '/api/login'),
-                   json={'name': username, 'password': password}, timeout=10)
-        if r.status_code == 200:
-            data = r.json()
-            token = data.get('token', '')
-            if token:
-                s.headers['Authorization'] = f'Bearer {token}'
-                return True, token
-        elif r.status_code == 199:
-            safe_print(f"  {C.YLW}[*] 登录需要 2FA 验证 (HTTP 199){C.RST}")
-    except Exception as e:
-        safe_print(f"  {C.YLW}[*] 明文登录异常: {e}{C.RST}")
+    # ===== 方法 4: 尝试不带 EncryptedParams 的不同端点 =====
+    safe_print(f"  {C.CYN}    [4/4] 尝试其他登录方式...{C.RST}")
+    for login_path, payload in [
+        ('/api/user/login', {'username': username, 'password': password}),
+        ('/api/login', {'username': username, 'password': password}),
+        ('/api/login', {'user': username, 'pass': password}),
+    ]:
+        try:
+            r = s.post(build_url(url, login_path), json=payload, timeout=10)
+            if debug and r.status_code != 404:
+                safe_print(f"    {login_path} → [{r.status_code}] {r.text[:200]}")
+            if r.status_code == 200:
+                data = r.json()
+                token = data.get('token', '') or data.get('access_token', '')
+                if token:
+                    s.headers['Authorization'] = f'Bearer {token}'
+                    return True, token
+        except Exception:
+            continue
 
+    safe_print(f"  {C.RED}[-] 所有登录方式均失败{C.RST}")
     return False, ''
 
 
@@ -834,6 +875,7 @@ def main():
     parser.add_argument('--timeout', type=int, default=10, help='超时秒数 (默认 10)')
     parser.add_argument('--no-color', action='store_true', help='禁用彩色输出')
     parser.add_argument('--proxy', help='HTTP 代理')
+    parser.add_argument('--debug', action='store_true', help='调试模式, 打印详细请求/响应')
 
     sub = parser.add_subparsers(dest='mode', help='攻击模式')
     sub.add_parser('check', help='综合漏洞检测 (默认)')
