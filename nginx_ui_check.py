@@ -143,10 +143,10 @@ def login(url: str, s: requests.Session, username: str, password: str,
     # ===== 方法 3: RSA 加密登录 =====
     safe_print(f"  {C.CYN}    [3/4] RSA 加密 POST /api/login...{C.RST}")
     try:
-        # 获取公钥 (timestamp 必须传数字, 不能是字符串)
+        # 获取公钥 (timestamp 必须传数字, fingerprint 是必填字段)
         r_crypto = s.post(build_url(url, '/api/crypto/public_key'), json={
             'timestamp': int(_time.time() * 1000),
-            'browser_fingerprint': 'Mozilla/5.0',
+            'fingerprint': 'Mozilla/5.0',
         }, timeout=5)
         if debug:
             safe_print(f"    /api/crypto/public_key → [{r_crypto.status_code}] {r_crypto.text[:200]}")
