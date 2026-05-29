@@ -195,17 +195,23 @@ class PGRawConnection:
                 (self.host, self.port), timeout=self.timeout)
             self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
-            if ssl_mode == 'require':
+            # ---- SSL 协商 ----
+            # PostgreSQL 协议: 客户端先发 SSLRequest (length=8, code=80877103)
+            # 服务器回单字节: 'S'=支持 SSL, 'N'=不支持
+            if ssl_mode in ('prefer', 'require'):
                 self._send_int32(8)
                 self._send_int32(SSL_REQUEST_CODE)
-                self.sock.flush()  # dummy
-                resp = self.sock.recv(1)
-                if resp == b'S':
+                resp = self._recv_byte_safe()
+                if resp == ord('S'):
                     import ssl as _ssl
                     ctx = _ssl.create_default_context()
                     ctx.check_hostname = False
                     ctx.verify_mode = _ssl.CERT_NONE
                     self.sock = ctx.wrap_socket(self.sock)
+                elif ssl_mode == 'require':
+                    safe_print(f"  {C.RED}[-] 服务器不支持 SSL (require 模式){C.RST}")
+                    return False
+                # prefer 模式: 服务器回复 'N', 继续明文
 
             return True
         except socket.timeout:
@@ -238,6 +244,17 @@ class PGRawConnection:
 
     def _recv_byte(self) -> int:
         return self._recv_exact(1)[0]
+
+    def _recv_byte_safe(self, timeout: float = 3.0) -> int:
+        """带超时的单字节读取, 用于 SSL 协商"""
+        old_timeout = self.sock.gettimeout()
+        self.sock.settimeout(timeout)
+        try:
+            return self._recv_exact(1)[0]
+        except Exception:
+            return -1
+        finally:
+            self.sock.settimeout(old_timeout)
 
     def _recv_string(self) -> str:
         chars = []
@@ -662,6 +679,15 @@ def detect_postgres(host: str, port: int = 5432, timeout: int = 10) -> Tuple[boo
 
     try:
         resp = pg.startup()
+
+        # 服务器返回了 ErrorResponse
+        if 'error' in resp:
+            err = resp['error']
+            codes = {err.get(k, '') for k in err if k != '_type'}
+            err_str = err.get('M', '') or err.get('S', '') or str(err)
+            safe_print(f"  {C.GRN}[+] 确认 PostgreSQL — 但被拒绝: {err_str[:200]}{C.RST}")
+            return True, info
+
         if resp.get('ready') or resp.get('auth_type') is not None:
             info.update(resp)
             ver = info.get('server_version', 'unknown')
