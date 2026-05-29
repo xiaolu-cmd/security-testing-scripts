@@ -1,0 +1,9 @@
+<plugin>
+    <class>com.securitytest.SecurityTestPlugin</class>
+    <name>Security Test Plugin</name>
+    <description>用于授权安全测试的验证插件 - CVE-2023-32315 靶场测试用</description>
+    <author>Security Tester</author>
+    <version>1.0.0</version>
+    <date>2024-01-01</date>
+    <minServerVersion>3.10.0</minServerVersion>
+</plugin>
