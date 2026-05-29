@@ -77,7 +77,7 @@
 
 | 脚本 | 说明 |
 |------|------|
-| `svg-xss.py` | SVG XSS Scanner — Burp 被动扫描插件，检测 SVG 文件中的 XSS 注入点 |
+| `svg-xss.py` | SVG XSS Scanner — Burp 扩展，5 种 SVG XSS payload 库、被动/安全注入双模式、Site Map SVG 查找、自动 Burp Issue 创建、多编码响应解码、深色主题 HTML 展示 |
 
 ## 工具 / 辅助
 
@@ -154,5 +154,6 @@ python <script>.py -h
 | Supervisord | `supervisord_exploit.py` | 严重 (RCE) |
 | ThinkPHP | `thinkphp5_check.py` | 严重 (RCE) |
 | VNC | `ylm.py` | 高 (认证绕过) |
+| SVG XSS | `svg-xss.py` | 高 (Burp 扩展) |
 | XWiki | `xwiki.py` | 严重 (RCE) |
 | 然之 OA | `yanzhi_oa.py` | 高 (加密破解) |
